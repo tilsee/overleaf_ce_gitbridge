@@ -1,0 +1,10 @@
+services:
+  gitbridge:
+    build: .
+    container_name: gitbridge
+    env_file:
+      - .env
+    volumes:
+      - ./compiles:/data/compiles:ro
+      - ./gitignore.template:/app/gitignore.template:ro
+    restart: unless-stopped

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -48,6 +49,19 @@ class Config:
         
         # Create temp directory if it doesn't exist
         self.temp_dir_base.mkdir(parents=True, exist_ok=True)
+        
+        # Validate GitHub token format
+        if self.github_token:
+            self._validate_github_token()
+    
+    def _validate_github_token(self) -> None:
+        """Validate GitHub token format."""
+        token = self.github_token.strip()
+        if not token.startswith(('ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_')):
+            logger.warning("GitHub token doesn't appear to be in the expected format. "
+                          "Expected formats: ghp_, gho_, ghu_, ghs_, ghr_")
+        if len(token) < 20:
+            logger.warning("GitHub token appears to be too short")
 
 
 class GitOperations:
@@ -61,13 +75,27 @@ class GitOperations:
         if not token or not url.startswith("https://github.com/"):
             return url
         
-        return url.replace("https://github.com/", f"https://{token}@github.com/")
+        # Ensure the token doesn't have any whitespace or special characters
+        clean_token = token.strip()
+        auth_url = url.replace("https://github.com/", f"https://{clean_token}@github.com/")
+        
+        # Log the URL format for debugging (without exposing the token)
+        logger.debug(f"Original URL: {url}")
+        logger.debug(f"Authenticated URL format: https://***TOKEN***@github.com/{url.split('github.com/')[1]}")
+        
+        return auth_url
     
     def run_git_command(self, cmd: List[str], cwd: Optional[Union[str, Path]] = None, 
                         check: bool = True) -> subprocess.CompletedProcess:
         """Run a git command safely without leaking credentials."""
         try:
-            return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
+            # Set environment variables to prevent Git from prompting for credentials
+            env = os.environ.copy()
+            env['GIT_TERMINAL_PROMPT'] = '0'  # Disable terminal prompts
+            env['GIT_ASKPASS'] = ''  # Disable askpass
+            env['SSH_ASKPASS'] = ''  # Disable SSH askpass
+            
+            return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True, env=env)
         except subprocess.CalledProcessError as e:
             # Sanitize error output to remove token
             if self.config.github_token:
@@ -82,6 +110,16 @@ class GitOperations:
             return bool(result.stdout.strip())
         except Exception:
             logger.exception("Error checking for tracked files")
+            return False
+    
+    def test_authentication(self, auth_url: str) -> bool:
+        """Test if the authentication URL works by attempting to list refs."""
+        try:
+            # Use git ls-remote to test authentication without cloning
+            result = self.run_git_command(["git", "ls-remote", "--heads", auth_url], check=False)
+            return result.returncode == 0
+        except Exception:
+            logger.exception("Error testing authentication")
             return False
 
 
@@ -125,6 +163,11 @@ class GitHubBridge:
                 # Convert URL to authenticated URL using token
                 auth_repo_url = self.git.add_token_to_url(repo_url, self.config.github_token)
                 
+                # Test authentication before proceeding
+                if not self.git.test_authentication(auth_repo_url):
+                    logger.error(f"Authentication failed for repository: {repo_url}")
+                    continue
+                
                 # Process the repository
                 self.sync_with_github(folder_path, auth_repo_url, repo_url)
                 
@@ -145,7 +188,15 @@ class GitHubBridge:
             
             # Clone repository
             logger.info(f"Cloning repository for {folder_name}...")
-            self.git.run_git_command(["git", "clone", "--depth=1", auth_repo_url, str(temp_dir)])
+            try:
+                self.git.run_git_command(["git", "clone", "--depth=1", auth_repo_url, str(temp_dir)])
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to clone repository {public_repo_url}: {e.stderr}")
+                raise
+            
+            # Configure Git to not prompt for credentials
+            self.git.run_git_command(["git", "config", "credential.helper", ""], temp_dir)
+            self.git.run_git_command(["git", "config", "core.askPass", ""], temp_dir)
             
             # Add gitignore if needed
             gitignore_path = temp_dir / ".gitignore"
